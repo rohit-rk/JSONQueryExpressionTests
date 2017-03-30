@@ -83,6 +83,7 @@ Having the machine manage the data schema gives us a new set of tools:
 * Elasticsearch 1.x has limited automatic schema detection which has proven useful for indexing and summarizing data of unknown shapes. We would like to generalize this nice feature and and bring machine managed schemas to other datastores.   
 * Oracle uses [json_*](http://www.oracle.com/technetwork/database/sql-json-wp-2604702.pdf) functions to define views which can operate on JSON. It has JSON path expressions; mimicking MDX, but the overall query syntax is clunky. Links: [A](https://docs.oracle.com/database/121/ADXDB/json.htm#ADXDB6246), [B](https://blogs.oracle.com/jsondb/entry/s)
 * Spark has [Schema Merging](http://spark.apache.org/docs/latest/sql-programming-guide.html#schema-merging) and nested object arrays can be accessed using [explode()](https://spark.apache.org/docs/latest/api/python/pyspark.sql.html?highlight=explode#pyspark.sql.functions.explode). Spark is a little more elegant, despite the the fact it exposes *how* the query executes.
+* Sqlite has the [JSON1 connector](https://www.sqlite.org/json1.html) - Which is a limited form of Oracle's solution; it requires manual schema translation which complicates queries. 
 
 These existing solutions solve the hard problems from the bottom up; managing file formats, organizing indexes, managing resources and query planning. Each built their own stack with their own query conventions guided by the limitations of architecture they built. 
 
@@ -120,15 +121,20 @@ Even though Sqlite is preferred, the choice of datastore is not very important t
 * **Machine Managed indexes** - Databases indexes act much like a columnar datastore. If we account for the common queries received, we may be able to choose the right indexes to improve query response. We might just beat Elasticsearch!
 * **Subqueries** - Allowing heterogeneous datastores also allows us to split queries across platforms so each backend can handle the part it is best at; By dispatching data aggregation and filtering to a cluster we get fast response over big data, while a local database can use previous query results to perform sophisticated cross referencing and window functions.
 
-##Questions and Answers
+## Questions and Answers
 
 **Where do I start?**
 
 > Be sure to read this document, and read the links. Especially [JSON Query Expressions](https://github.com/klahnakoski/ActiveData/blob/dev/docs/jx.md), which will give you a high level idea of what you will be building.
 > 
 > I attempted a solution ([jx-sqlite](https://github.com/klahnakoski/jx-sqlite/tree/master)) but it is far from a complete. The tests that do pass are the easy tests the hard tests remain; It might require a refactoring of the code. I only suggest extending this code if you are unusually good at understanding other people's code.
-
+>
 > Building your own solution from scratch is a reasonable path to take.  This will allow you to understand the problem without understanding how my incomplete solution tried to solve the problem. It may be less work overall. You can fork the [jx-sqlite](https://github.com/klahnakoski/jx-sqlite/tree/master) code, remove all the implementation and start writing code that will pass tests. 
+
+
+**Can I fork ActiveData?**
+
+> Forking ActiveData is not a good idea: ActiveData works with ElasticSearch 1.7 which can already deal with nested object arrays, and perform schema merging. Elasticsearch uses a completely different data model from relational databases.Tracking the nested object array schema and translating the queries is the hard part of using Sqlite.
 
 
 **What is to be done next in `jx-sqlite`?**
@@ -136,9 +142,61 @@ Even though Sqlite is preferred, the choice of datastore is not very important t
 > If you are comfortable with extending [jx-sqlite](https://github.com/klahnakoski/jx-sqlite/tree/master), then it is obvious to ask where is the hole to be filled:
 > The majority of the problem is performing the deep queries: When JSON documents are added, the library is responsible for creating tables to hold the contents of any arrays - this is broken because the schema management is not clear and there are bugs. The current code is too complicated to understand in a single sitting; so I started a refactor to that will provide an API to a snowflake schema; it will map a hierarchical (snowflake) schema to a sqlite relational database. Hopefully, the JSON <-> Snowflake <-> sqlite transform will prove easier to understand and we can pass some of the more complicated tests.
 
+**What about the JSON1 connector for Sqlite?**
+
+> The [JSON1 connector](https://www.sqlite.org/json1.html) is a limited form of Oracle's JSON query features; it provides functions over a BLOB, and this limits what the database can do to make queries faster. I want a solution that can leverage the features of a database; like profile statistics, query optimization, ability to add indexes, materialized views, and SQL.
+>
+> Yes, including SQL: JSON query expressions are designed to make complex data easy to query, but they are limited to viewing data as belonging to a data cube; having general SQL expressions opens the data up to more complex analysis. With JSON properties fully decomposed to the database we get both complex and optimized queries.
+
+
 **Why does `jx-sqlite` use pyLibrary?**
 
 > The [jx-sqlite](https://github.com/klahnakoski/jx-sqlite/tree/master) implementation has an unfortunate interdependence with pyLibrary; It would be nice to decouple these two.
+
+
+**May you give me a test that is easy to solve?**
+
+> Here is a test that is relatively easy to solve: [`test_select3_object(self)`](https://github.com/klahnakoski/jx-sqlite/blob/master/tests/test_jx/test_set_ops.py#L942) It is returning the wrong number of columns when returning `"format":"table"`.
+>
+> This test is about interpreting the meaning of `{"select": ["o", "a.*"]}` in the context of formatting as a table.  As per [the user documentation on `select`](https://github.com/klahnakoski/ActiveData/blob/dev/docs/jx_clause_select.md#selecting-leaves-), we expect the star (`*`) to expand all leaves into individual columns, which did not happen in this test.
+>
+> Put a breakpoint in the code at [setop_table.py, line 323](https://github.com/klahnakoski/jx-sqlite/blob/04752922974a84f225dd9b058c4c939989b613e9/jx_sqlite/setop_table.py#L323) (Notice the test is named "set_ops" and the code is named similarly as "setop") This is the point just before the data is formatted into table form; we first ensure the data (in `result.data`) has all the records we require; it could be that the query is wrong (but the data looks good). Then we can check to see why we are getting less columns than we expect: Step through the formatting code to understand what it is doing. Also, understand how the properties for the columns in `for c in cols` are used to decide what the `header` should be.
+
+
+**May you give me test that is complicated to solve?**
+
+> When you run the tests you will notice many "deep" tests are failing.  Here is one of the failing tests [`test_deep_select_column(self)`](https://github.com/klahnakoski/jx-sqlite/blob/master/tests/test_jx/test_deep_ops.py#L25)
+> 
+>This test is performing a query on the following data:
+
+```javascript
+	"data": [
+    	{"_a": [
+	        {"b": "x", "v": 2},
+        	{"b": "y", "v": 3}
+    	]},
+    	{"_a": {"b": "x", "v": 5}},
+    	{"_a": [
+	        {"b": "x", "v": 7},
+	    ]},
+	    {"c": "x"}
+	]
+```
+
+> The important feature of this is the nested array of objects; which is what we are interested in querying.  This test is ensuring you can groupby `_a.b` and calculate the aggregate sum of `_a.v`
+> 
+> But the problem is greater than just getting the correct result; this test can not even insert the data into the database correctly:
+
+```
+	caused by
+	    ERROR: Problem with
+	    ALTER TABLE "testing._a" ADD COLUMN "_a.b.$string" TEXT
+   		File "C:\Python27\lib\site-packages\mo_threads\threads.py", line 237, in _run
+	caused by
+    	ERROR: duplicate column name: _a.b.$string
+```
+
+> So, the problem appears to be some confusion about how the schema is modified before the records are inserted into the database. I have determined that this confusion is caused by bad programming; [so I started refactoring the parts dealing with managing the schema](https://github.com/klahnakoski/jx-sqlite/blob/master/jx_sqlite/alter_table.py). With all the methods in one place, I can now come up with some coherent design for this API: Something that is easy for the rest of the `jx-sqlite` code to manipulate snowflake schemas, and how to build them. The code for this API will be responsible for translating a snowflake schema into a plain relational database schema.
 
 
 **Why Python 2.7? Are you a dinosaur?**
@@ -147,13 +205,13 @@ Even though Sqlite is preferred, the choice of datastore is not very important t
 
 **Where will this code be used?**
 
-> 1a) It will enhance ActiveData: When ActiveData pulls data from the cluster, it would be nice to handle sub queries on that data before it gets sent back to the requester. Python is too slow to manipulate data, so we either require a temporary database or Numpy or Pandas. The hope is this project can handle the JSON coming from Elasticsearch queries and perform the required post-processing queries on that data.
-
-> 1b) It will enhance ActiveData: ActiveData tracks the Elasticsearch cluster metadata to help translate queries. This is too much data to handle quickly with pure Python. The hope is this project will serve as a fast metadata database.   
-
-> 2) SpotManager:  The SpotManager is responsible for bidding for spot instances on AWS. It deals with a reasonable amount of data, but is slow because the queries are implemented in Python. Sqlite can go much faster for the given data volume.
-
-> 3) esShardBalancer - Another pure-python program than can be made to go faster if queries were implemented in Sqlite.
+> 1. It will enhance ActiveData: When ActiveData pulls data from the cluster, it would be nice to handle sub queries on that data before it gets sent back to the requester. Python is too slow to manipulate data, so we either require a temporary database or Numpy or Pandas. The hope is this project can handle the JSON coming from Elasticsearch queries and perform the required post-processing queries on that data.
+>
+> 2. It will enhance ActiveData: ActiveData tracks the Elasticsearch cluster metadata to help translate queries. This is too much data to handle quickly with pure Python. The hope is this project will serve as a fast metadata database.   
+>
+> 3. SpotManager:  The SpotManager is responsible for bidding for spot instances on AWS. It deals with a reasonable amount of data, but is slow because the queries are implemented in Python. Sqlite can go much faster for the given data volume.
+>
+> 4. esShardBalancer - Another pure-python program than can be made to go faster if queries were implemented in Sqlite.
 
 > In general, code can make better decisions if it has lots of data. Python is too slow for this task, so we need a module that can handle data for us; something that accepts queries that will return short results to make decisions on. This data can come from any number of systems, in large quantities, and of changing schema over time. **We do not want to be manually declaring schemas for relations and properties not used by the code.** At the same time, we want to keep all the data in case we want to make decisions on it later, either as feature enhancement or for manual debugging.
 
